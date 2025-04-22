@@ -1,0 +1,17 @@
+requests
+dotenv
+flask
+PyPDF2
+pyodbc>=4.0.30
+pandas
+ngrok
+io
+base64
+qrcode[pil]
+fitz
+Pillow
+PyMuPDF
+opencv-python
+openai
+fastapi
+uvicorn

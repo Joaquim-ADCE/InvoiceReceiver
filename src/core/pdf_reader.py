@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings("ignore", message="CropBox missing from /Page, defaulting to MediaBox")
+
 import io
 import pdfplumber
 from typing import List

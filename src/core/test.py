@@ -3,21 +3,20 @@
 import os
 import sys
 import base64
-import pandas as pd
 from pathlib import Path
-from dotenv import load_dotenv
 
-# Setup
-project_root = str(Path(__file__).parent.parent.absolute())
+# Setup - Move this BEFORE any project imports
+project_root = str(Path(__file__).parent.parent.parent.absolute())  # Changed to include one more parent
 sys.path.insert(0, project_root)
 
-# Imports
+# Now we can import project modules
+import pandas as pd
+from dotenv import load_dotenv
 from config.graph_api import GraphClient
 from src.core.qr_reader import extract_qr_from_pdf_bytes
 from src.core.vendor_validation import validate_vendors_by_nif
 from src.core.invoice_validation import check_if_invoices_are_registered
 from src.core.openai_client import suggest_gl_account_from_pdf
-from src.core.debug_gpt_inputs import debug_save_df
 
 # Utilities
 def parse_qr_to_dataframe(qr_string: str) -> pd.DataFrame:
@@ -75,14 +74,10 @@ def test_email_pdf_fetch_and_classify():
         return
 
     all_qr_df = pd.concat(all_qr_data, ignore_index=True)
-    debug_save_df(all_qr_df, "parsed_qr_data")
 
     # Step 1: Vendor Validation
     print("\n1⃣ Validating vendors against NAVISION...")
     valid_vendors_df, invalid_vendors_df = validate_vendors_by_nif(all_qr_df)
-
-    debug_save_df(valid_vendors_df, "valid_vendors")
-    debug_save_df(invalid_vendors_df, "invalid_vendors")
 
     print(f"✅ Valid vendors: {len(valid_vendors_df)}")
     print(f"❌ Invalid vendors: {len(invalid_vendors_df)}")
@@ -101,9 +96,6 @@ def test_email_pdf_fetch_and_classify():
     else:
         new_invoices_df = pd.DataFrame()
         duplicate_invoices_df = pd.DataFrame()
-
-    debug_save_df(new_invoices_df, "new_invoices")
-    debug_save_df(duplicate_invoices_df, "duplicate_invoices")
 
     # Step 3: GPT Suggestions for GL Accounts
     print("\n🧐 Asking GPT for GL account suggestions...")
@@ -133,7 +125,6 @@ def test_email_pdf_fetch_and_classify():
         })
 
     suggestions_df = pd.DataFrame(gl_suggestions)
-    debug_save_df(suggestions_df, "gl_suggestions")
     suggestions_df.to_csv("gl_suggestions.csv", index=False)
 
     # Save results

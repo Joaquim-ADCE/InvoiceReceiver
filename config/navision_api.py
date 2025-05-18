@@ -1,70 +1,100 @@
 import os
 import requests
-from requests_ntlm import HttpNtlmAuth
-from typing import List, Dict
-from dotenv import load_dotenv
 import logging
+import pandas as pd
+from typing import List, Dict, Optional
+from requests_ntlm import HttpNtlmAuth
+from dotenv import load_dotenv
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
 
-def get_navision_vendors():
-    """Fetch vendors from Navision using NTLM authentication."""
+def _get_ntlm_session() -> requests.Session:
+    """Create an NTLM-authenticated session."""
+    session = requests.Session()
+    session.auth = HttpNtlmAuth(
+        f"{os.getenv('NAVISION_DOMAIN')}\\{os.getenv('NAVISION_USERNAME')}",
+        os.getenv('NAVISION_PASSWORD')
+    )
+    return session
+
+def _build_navision_url(endpoint: str) -> str:
+    """Construct the full NAVISION API URL."""
+    return f"{os.getenv('NAVISION_BASE_URL')}/{endpoint}"
+
+def _fetch_data(endpoint: str) -> Optional[List[Dict]]:
+    """Fetch and parse data from a NAVISION OData endpoint."""
     try:
-        # Get credentials from environment variables
-        base_url = os.getenv('NAVISION_BASE_URL')
-        username = os.getenv('NAVISION_USERNAME')
-        domain = os.getenv('NAVISION_DOMAIN')
-        password = os.getenv('NAVISION_PASSWORD')
-
-        print(f"Connecting to Navision at {base_url}")
-        print(f"Using credentials: {domain}\\{username}")
-
-        # Create session with NTLM authentication
-        session = requests.Session()
-        session.auth = HttpNtlmAuth(f"{domain}\\{username}", password)
-        
-        # Make the request
-        url = f"{base_url}/Ficha_Fornecedor"
-        print(f"Requesting URL: {url}")
-        
-        response = session.get(url, verify=False)  # verify=False for self-signed certs
-        
-        if response.status_code != 200:
-            print(f"Error response: {response.status_code}")
-            print(f"Response content: {response.text}")
-            response.raise_for_status()
-        
-        # Parse response
-        data = response.json()
-        vendors = data.get('value', [])
-        print(f"Successfully fetched {len(vendors)} vendors")
-        return vendors
-
-    except Exception as e:
-        print(f"Failed to fetch vendors from NAVISION: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return []
-
-def get_registered_invoices() -> list[str]:
-    """Fetch already registered invoice numbers from NAVISION."""
-    try:
-        base_url = os.getenv('NAVISION_BASE_URL')
-        username = os.getenv('NAVISION_USERNAME')
-        domain = os.getenv('NAVISION_DOMAIN')
-        password = os.getenv('NAVISION_PASSWORD')
-
-        session = requests.Session()
-        session.auth = HttpNtlmAuth(f"{domain}\\{username}", password)
-
-        url = f"{base_url}/Faturas_Compra_Regist"
-        print(f"Fetching registered invoices from: {url}")
-
+        session = _get_ntlm_session()
+        url = _build_navision_url(endpoint)
         response = session.get(url, verify=False)
         response.raise_for_status()
-
-        data = response.json().get("value", [])
-        return [item["Vendor_Invoice_No"].strip() for item in data if "Vendor_Invoice_No" in item]
+        return response.json().get("value", [])
     except Exception as e:
-        print(f"Error fetching registered invoices: {e}")
+        logging.error(f"❌ Error fetching data from {endpoint}: {e}")
+        return None
+
+def get_navision_vendors() -> List[Dict]:
+    """Fetch vendors using existing vendor endpoint."""
+    try:
+        session = _get_ntlm_session()
+        url = _build_navision_url("Ficha_Fornecedor")
+        response = session.get(url, verify=False)
+        response.raise_for_status()
+        data = response.json()
+        vendors = data.get("value", [])
+        logging.info(f"✅ Retrieved {len(vendors)} vendors.")
+        return vendors
+    except Exception as e:
+        logging.error(f"❌ Failed to fetch vendors: {e}")
         return []
+
+def get_gl_accounts() -> pd.DataFrame:
+    """Fetch C/G (GL) account records."""
+    data = _fetch_data("Contas_C_G")
+    return pd.DataFrame(data) if data else pd.DataFrame()
+
+def get_registered_invoice_lines() -> pd.DataFrame:
+    """Fetch registered invoice lines."""
+    data = _fetch_data("Linhas_Compras_registadas")
+    return pd.DataFrame(data) if data else pd.DataFrame()
+
+def get_registered_invoice_headers() -> pd.DataFrame:
+    """Fetch registered invoice headers."""
+    data = _fetch_data("Faturas_Compra_Regist")
+    return pd.DataFrame(data) if data else pd.DataFrame()
+
+def get_vendor_history() -> pd.DataFrame:
+    """
+    Returns a cleaned invoice history with key fields:
+    Document_No, Buy_from_Vendor_No, No_line (as invoice ID), and Description.
+    """
+    lines = get_registered_invoice_lines()
+    headers = get_registered_invoice_headers()
+
+    if lines.empty:
+        logging.warning("⚠️ No invoice lines found.")
+        return pd.DataFrame()
+
+    if headers.empty:
+        logging.warning("⚠️ No invoice headers found. Returning lines only.")
+        return lines[["Document_No", "No_line"]]  # Minimal fallback
+
+    joined = lines.merge(
+        headers,
+        how="left",
+        left_on="Document_No",
+        right_on="No",
+        suffixes=("_line", "_header")
+    )
+
+    joined.reset_index(drop=True, inplace=True)
+    joined["No"] = joined["No_line"]
+
+    # Cleaned output
+    required_columns = ["Document_No", "Buy_from_Vendor_No", "No_line", "Description", "Vendor_Invoice_No", "Line_Amount"]
+    cleaned_df = joined[required_columns].copy()
+
+    logging.info(f"✅ Vendor history: {len(cleaned_df)} records with selected columns.")
+    return cleaned_df
+

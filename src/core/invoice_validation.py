@@ -1,7 +1,5 @@
-# src/core/check_invoice_duplicates.py
-
 import pandas as pd
-from config.navision_api import get_registered_invoices
+from config.navision_api import get_vendor_history
 
 def check_if_invoices_are_registered(qr_data_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
@@ -18,7 +16,8 @@ def check_if_invoices_are_registered(qr_data_df: pd.DataFrame) -> tuple[pd.DataF
     if "G" not in qr_data_df.columns:
         raise ValueError("Column 'G' (Vendor_Invoice_No) is required in QR data.")
 
-    registered_invoice_nos = set(get_registered_invoices())
+    registered_invoices_df = get_vendor_history()
+    registered_invoice_nos = set(registered_invoices_df['Vendor_Invoice_No'].values)
 
     qr_data_df = qr_data_df.copy()
     qr_data_df["already_registered"] = qr_data_df["G"].isin(registered_invoice_nos)

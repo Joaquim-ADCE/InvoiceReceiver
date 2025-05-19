@@ -9,7 +9,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from openai import OpenAI
 from config.navision_api import get_vendor_history, get_gl_accounts
 from src.core.pdf_reader import extract_text_from_pdf_bytes
-from src.core.debug_gpt_inputs import debug_save_df, debug_log_gpt_input
+from legacy.debug_gpt_inputs import debug_save_df, debug_log_gpt_input
 
 # Allow switching model via env; default to 32k context
 GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4-turbo-32k")

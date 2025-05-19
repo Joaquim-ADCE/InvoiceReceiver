@@ -1,19 +1,21 @@
 import os
 import requests
 import base64
-from typing import List, Dict, Optional
+from typing import List, Dict
 from dotenv import load_dotenv
+from datetime import datetime
+from zoneinfo import ZoneInfo  # Python 3.9+
 
 load_dotenv()
 
-TENANT_ID = os.getenv("TENANT_ID")
-CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-USER_EMAIL = os.getenv("USER_EMAIL")
-GRAPH_API_BASE = os.getenv("GRAPH_API_BASE_URL", "https://graph.microsoft.com/v1.0")
-TOKEN_ENDPOINT = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
-SCOPES = ["https://graph.microsoft.com/.default"]
-
+TENANT_ID        = os.getenv("TENANT_ID")
+CLIENT_ID        = os.getenv("CLIENT_ID")
+CLIENT_SECRET    = os.getenv("CLIENT_SECRET")
+USER_EMAIL       = os.getenv("USER_EMAIL")
+SENDER_EMAIL     = os.getenv("SENDER_EMAIL")
+GRAPH_API_BASE   = os.getenv("GRAPH_API_BASE_URL", "https://graph.microsoft.com/v1.0")
+TOKEN_ENDPOINT   = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+SCOPES           = ["https://graph.microsoft.com/.default"]
 
 class GraphClient:
     def __init__(self):
@@ -21,80 +23,54 @@ class GraphClient:
 
     def _get_access_token(self) -> str:
         payload = {
-            "grant_type": "client_credentials",
-            "client_id": CLIENT_ID,
+            "grant_type":    "client_credentials",
+            "client_id":     CLIENT_ID,
             "client_secret": CLIENT_SECRET,
-            "scope": " ".join(SCOPES),
+            "scope":         " ".join(SCOPES),
         }
-        response = requests.post(TOKEN_ENDPOINT, data=payload)
-        response.raise_for_status()
-        return response.json()["access_token"]
+        r = requests.post(TOKEN_ENDPOINT, data=payload)
+        r.raise_for_status()
+        return r.json()["access_token"]
 
-    def _get_headers(self) -> dict:
+    def _get_headers(self) -> Dict[str, str]:
         return {
             "Authorization": f"Bearer {self.access_token}",
             "Content-Type": "application/json"
         }
 
-    def get_all_emails(self, top: int = 50) -> List[Dict]:
-        """Fetch all emails (read and unread) with pagination and attachments."""
-        headers = self._get_headers()
-        messages = []
-        url = f"{GRAPH_API_BASE}/users/{USER_EMAIL}/messages?$expand=attachments&$orderby=receivedDateTime desc&$top={top}"
+    def get_emails_from_sender_today(self, top: int = 50) -> List[Dict]:
+        """
+        Fetch up to `top` messages sent by SENDER_EMAIL, received since
+        00:00 in Europe/Lisbon local time today, newest first.
+        """
+        # 1) Load sender and compute midnight today in Lisbon
+        sender = SENDER_EMAIL
+        tz = ZoneInfo("Europe/Lisbon")
+        today_midnight = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+        # 2) Convert to UTC ISO format for Graph
+        since_utc = today_midnight.astimezone(ZoneInfo("UTC")).isoformat()
 
-        while url:
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-            messages.extend(data.get("value", []))
-            url = data.get("@odata.nextLink")
-
-        return messages
-
-    def get_all_emails_from(self, sender_email: str = "ngomes@adcecija.pt", top: int = 50) -> List[Dict]:
-        """Fetch all emails and filter for those from a specific sender."""
-        headers = self._get_headers()
-        messages = []
-        url = (
-            f"{GRAPH_API_BASE}/users/{USER_EMAIL}/messages"
-            f"?$expand=attachments"
-            f"&$orderby=receivedDateTime desc"
-            f"&$top={top}"
+        # 3) Build the OData filter
+        filter_query = (
+            f"receivedDateTime ge {since_utc} "
+            f"and from/emailAddress/address eq '{sender}'"
         )
 
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        all_messages = data.get("value", [])
-        
-        # Filter for emails from the specific sender
-        messages = [
-            msg for msg in all_messages
-            if msg.get("from", {}).get("emailAddress", {}).get("address") == sender_email
-        ]
+        # 4) Use params to let requests handle URL-encoding
+        params = {
+            "$filter":  filter_query,
+            "$expand":  "attachments",
+            "$orderby": "receivedDateTime desc",
+            "$top":     str(top),
+        }
+        url = f"{GRAPH_API_BASE}/users/{USER_EMAIL}/messages"
 
-        return messages
+        r = requests.get(url, headers=self._get_headers(), params=params)
+        r.raise_for_status()
+        return r.json().get("value", [])
 
-    def extract_attachments(self, message: Dict) -> List[Dict]:
-        """Extract and decode attachments from a single email message."""
-        attachments = []
-        for att in message.get("attachments", []):
-            if att.get("@odata.type") == "#microsoft.graph.fileAttachment":
-                try:
-                    decoded = base64.b64decode(att["contentBytes"])
-                    attachments.append({
-                        "name": att["name"],
-                        "content": decoded,
-                        "contentType": att["contentType"]
-                    })
-                except Exception as e:
-                    print(f"Failed to decode {att['name']}: {e}")
-        return attachments
-
-    def save_attachments(self, message: Dict, save_dir: str = "attachments") -> None:
-        """Save all attachments from a message to disk."""
-        os.makedirs(save_dir, exist_ok=True)
-        for attachment in self.extract_attachments(message):
-            path = os.path.join(save_dir, attachment["name"])
-            with open(path, "wb") as f:
-                f.write(attachment["content"])
+    def get_all_emails(self, top: int = 50) -> List[Dict]:
+        """
+        Alias for get_emails_from_sender_today to avoid changing call sites.
+        """
+        return self.get_emails_from_sender_today(top)

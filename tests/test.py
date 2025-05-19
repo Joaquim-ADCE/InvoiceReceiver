@@ -1,158 +1,176 @@
-# === Revised test.py ===
-
+#!/usr/bin/env python3
+"""
+Orchestrator script: fetch emails, extract QR data, validate and dedupe invoices,
+post headers and lines to Navision, log results, and send a report email.
+"""
 import os
 import sys
 import base64
-import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv
+import pandas as pd
 
-# Setup
-project_root = str(Path(__file__).parent.parent.absolute())
-sys.path.insert(0, project_root)
+# Setup repo root and load env
+repo_root = Path(__file__).parent.parent.resolve()
+sys.path.insert(0, str(repo_root))
+load_dotenv()
 
 # Imports
 from config.graph_api import GraphClient
+from src.core.email_reader import fetch_emails_with_pdfs
 from src.core.qr_reader import extract_qr_from_pdf_bytes
+from utils.qr_utils import parse_qr_to_dataframe
 from src.core.vendor_validation import validate_vendors_by_nif
 from src.core.invoice_validation import check_if_invoices_are_registered
+from src.core.header_payload import build_header_payload
+from src.core.line_payload import build_line_payload
+from config.navision_api import post_invoice_header, post_invoice_line
+from utils.invoice_logger import log_invoice
+from utils.report_generator import send_report
 from src.core.openai_client import suggest_gl_account_from_pdf
-from src.core.debug_gpt_inputs import debug_save_df
 
-# Utilities
-def parse_qr_to_dataframe(qr_string: str) -> pd.DataFrame:
-    try:
-        parts = qr_string.split("*")
-        fields = dict(part.split(":", 1) for part in parts if ":" in part)
-        return pd.DataFrame([{"A": fields.get("A", "").strip(), "G": fields.get("G", "").strip()}])
-    except Exception as e:
-        print(f"Failed to parse QR: {e}")
-        return pd.DataFrame()
-
-def clean_pycache():
-    import shutil
-    for root, dirs, files in os.walk(project_root):
-        for d in dirs:
-            if d == "__pycache__":
-                full_path = os.path.join(root, d)
-                shutil.rmtree(full_path)
-                print(f"🩹 Removed cache: {full_path}")
-
-# Main Function
-def test_email_pdf_fetch_and_classify():
-    print("\n📩 Fetching emails...")
+def orchestrate(period_days: int = 1):
+    """
+    Full pipeline for invoice insertion:
+      1. Fetch today’s emails from SENDER_EMAIL with PDF attachments
+      2. Extract and parse QR data from each PDF
+      3. Validate vendors, remove duplicates
+      4. For each new invoice:
+         a. Post header to Navision
+         b. Suggest GL account via GPT
+         c. Build and post lines for each VAT category (with VAT_Prod_Posting_Group)
+      5. Send processing report
+    """
+    print("📩 Fetching emails and PDFs...")
     client = GraphClient()
-    emails = client.get_all_emails_from("ngomes@adcecija.pt")
+    email_items = fetch_emails_with_pdfs(client)
 
-    all_qr_data = []
-    pdf_mapping = []
+    records = []
+    seen_attachments = set()
 
-    for email in emails:
-        subject = email.get("subject", "[No Subject]")
-        sender = email.get("from", {}).get("emailAddress", {}).get("name", "Unknown")
-        pdfs = [att for att in email.get("attachments", []) if att.get("contentType") == "application/pdf"]
+    for item in email_items:
+        for att in item['pdf_attachments']:
+            # Deduplicate by attachment id or name
+            att_key = att.get('id') or att.get('name')
+            if att_key in seen_attachments:
+                continue
+            seen_attachments.add(att_key)
 
-        for pdf in pdfs:
-            content_bytes = base64.b64decode(pdf["contentBytes"])
-            qr = extract_qr_from_pdf_bytes(content_bytes)
+            pdf_name = att.get('name', 'unnamed.pdf')
+            try:
+                content = base64.b64decode(att['contentBytes'])
+            except Exception as e:
+                log_invoice('', '', pdf_name, 'FAILURE', f'Decode error: {e}')
+                continue
 
-            if qr:
-                df = parse_qr_to_dataframe(qr)
-                if not df.empty:
-                    df["Email Subject"] = subject
-                    df["PDF Name"] = pdf.get("name", "Unnamed.pdf")
-                    all_qr_data.append(df)
+            qr_str = extract_qr_from_pdf_bytes(content)
+            if not qr_str:
+                log_invoice('', '', pdf_name, 'FAILURE', 'No QR code found')
+                continue
 
-                    pdf_mapping.append({
-                        "pdfs": [{
-                            "filename": pdf.get("name", "Unnamed.pdf"),
-                            "content": content_bytes
-                        }]
-                    })
+            df = parse_qr_to_dataframe(qr_str)
+            if df.empty:
+                log_invoice('', '', pdf_name, 'FAILURE', 'QR parse returned empty')
+                continue
 
-    if not all_qr_data:
-        print("❌ No QR data found.")
+            row = df.iloc[0].to_dict()
+            row['pdf_name'] = pdf_name
+            row['pdf_content'] = content
+            records.append(row)
+
+    if not records:
+        print("❌ No valid QR data to process.")
         return
 
-    all_qr_df = pd.concat(all_qr_data, ignore_index=True)
-    debug_save_df(all_qr_df, "parsed_qr_data")
+    qr_df = pd.DataFrame(records)
+    # Vendor validation
+    valid_df, invalid_df = validate_vendors_by_nif(qr_df)
+    # Duplicate check
+    new_df, dup_df = check_if_invoices_are_registered(valid_df)
 
-    # Step 1: Vendor Validation
-    print("\n1⃣ Validating vendors against NAVISION...")
-    valid_vendors_df, invalid_vendors_df = validate_vendors_by_nif(all_qr_df)
+    print(f"✅ Invalid vendors: {len(invalid_df)}")
+    print(f"✅ Duplicate invoices: {len(dup_df)}")
+    print(f"📑 New invoices: {len(new_df)}")
 
-    debug_save_df(valid_vendors_df, "valid_vendors")
-    debug_save_df(invalid_vendors_df, "invalid_vendors")
+    # Mapping from QR fields to Navision VAT Prod Posting Group
+    VAT_GROUP_MAP = {
+        "I2": "OBS-ISEN",
+        "I3": "OBS-RDZ",
+        "K3": "OBSND-RDZA",
+        "I5": "OBS-INT",
+        "I7": "OBS-NOR",
+        "J7": "OBS-NORMAD",
+    }
 
-    print(f"✅ Valid vendors: {len(valid_vendors_df)}")
-    print(f"❌ Invalid vendors: {len(invalid_vendors_df)}")
+    # Process each new invoice
+    for idx, inv in new_df.iterrows():
+        vendor_no     = inv['vendor_no']
+        vendor_inv_no = inv['G']
+        document_date = inv['F']
+        pdf_content   = records[idx]['pdf_content']
 
-    # Step 2: Check for duplicate invoices
-    print("\n2⃣ Checking for duplicate invoices...")
-    if not valid_vendors_df.empty:
-        new_invoices_df, duplicate_invoices_df = check_if_invoices_are_registered(valid_vendors_df)
-
-        new_invoices_df = new_invoices_df.drop(columns=["vendor_no"], errors="ignore")
-        new_invoices_df = new_invoices_df.merge(
-            valid_vendors_df[["A", "vendor_no"]],
-            on="A",
-            how="left"
-        )
-    else:
-        new_invoices_df = pd.DataFrame()
-        duplicate_invoices_df = pd.DataFrame()
-
-    debug_save_df(new_invoices_df, "new_invoices")
-    debug_save_df(duplicate_invoices_df, "duplicate_invoices")
-
-    # Step 3: GPT Suggestions for GL Accounts
-    print("\n🧐 Asking GPT for GL account suggestions...")
-    gl_suggestions = []
-
-    for i, invoice in new_invoices_df.iterrows():
-        vendor_nif = invoice["A"]
-        invoice_no = invoice["G"]
-        vendor_no = invoice.get("vendor_no")
-
-        if pd.isna(vendor_no):
-            print(f"⚠️ No vendor_no found for NIF {vendor_nif}. Skipping.")
+        # 1) Build and post header
+        header_payload = build_header_payload(vendor_no, vendor_inv_no, document_date)
+        resp_h = post_invoice_header(header_payload)
+        if not resp_h or 'No' not in resp_h:
+            log_invoice('', vendor_no, vendor_inv_no, 'FAILURE', 'HEADER post failed')
             continue
+        document_no = resp_h['No']
+        log_invoice(document_no, vendor_no, vendor_inv_no, 'SUCCESS', '')
 
-        email_meta = pdf_mapping[i] if i < len(pdf_mapping) else {}
-        try:
-            suggestion = suggest_gl_account_from_pdf(email_meta, vendor_no)
-        except Exception as e:
-            print(f"❌ GPT failed for invoice {invoice_no} from vendor {vendor_no}: {e}")
-            suggestion = "❗ GPT call error"
+        # 2) Suggest GL account via GPT
+        gl_account = suggest_gl_account_from_pdf({'pdfs': [{'content': pdf_content}]}, vendor_no)
 
-        gl_suggestions.append({
-            "vendor_nif": vendor_nif,
-            "vendor_no": vendor_no,
-            "invoice_no": invoice_no,
-            "suggested_gl": suggestion
-        })
+        # 3) Build and post lines for each VAT category
+        categories = [
+            (['I2','J2','K2'], []),  # 0% VAT
+            (['I3'], ['I4']),        # 6% VAT
+            (['J3'], ['J4']),        # 5% VAT
+            (['K3'], ['K4']),        # 4% VAT
+            (['I5'], ['I6']),        # 13% VAT
+            (['J5'], ['J6']),        # 12% VAT
+            (['K5'], ['K6']),        # 9% VAT
+            (['I7'], ['I8']),        # 23% VAT
+            (['J7'], ['J8']),        # 22% VAT
+            (['K7'], ['K8']),        # 16% VAT
+        ]
+        line_idx = 1
 
-    suggestions_df = pd.DataFrame(gl_suggestions)
-    debug_save_df(suggestions_df, "gl_suggestions")
-    suggestions_df.to_csv("gl_suggestions.csv", index=False)
+        for base_keys, vat_keys in categories:
+            # Sum up base and VAT amounts
+            base_amt = sum(float(inv.get(k) or 0) for k in base_keys)
+            vat_amt  = sum(float(inv.get(k) or 0) for k in vat_keys)
 
-    # Save results
-    print("\n✅ Results Summary:")
-    print(f"- Invalid vendors: {len(invalid_vendors_df)}")
-    print(f"- Duplicate invoices: {len(duplicate_invoices_df)}")
-    print(f"- New invoices to process: {len(new_invoices_df)}")
+            if base_amt or vat_amt:
+                # Pick VAT Prod Posting Group based on first non-zero base key
+                vat_group = None
+                for key in base_keys:
+                    try:
+                        if float(inv.get(key) or 0) != 0:
+                            vat_group = VAT_GROUP_MAP.get(key)
+                            break
+                    except ValueError:
+                        continue
 
-    invalid_vendors_df.to_csv("invalid_vendors.csv", index=False)
-    duplicate_invoices_df.to_csv("duplicate_invoices.csv", index=False)
-    new_invoices_df.to_csv("new_invoices.csv", index=False)
+                line_payload = build_line_payload(
+                    document_no=document_no,
+                    account_no=gl_account,
+                    amount_excl=base_amt,
+                    vat_amount=vat_amt,
+                    line_index=line_idx,
+                    vendor_no=vendor_no,
+                    vat_prod_posting_group=vat_group
+                )
+                resp_l = post_invoice_line(line_payload)
+                if resp_l and resp_l.get('Document_No') == document_no:
+                    log_invoice(document_no, vendor_no, vendor_inv_no, 'SUCCESS', '')
+                else:
+                    log_invoice(document_no, vendor_no, vendor_inv_no, 'FAILURE', f'LINE{line_idx} post failed')
+                line_idx += 1
 
-    print("\n📁 All outputs saved.")
-
-    print("\n🧼 Cleaning up __pycache__...")
-    clean_pycache()
-
-if __name__ == "__main__":
-    test_email_pdf_fetch_and_classify()
+    # 4) Send summary report
+    send_report(period_days)
 
 
-# === End of test.py ===
+if __name__ == '__main__':
+    orchestrate()

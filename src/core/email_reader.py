@@ -1,29 +1,32 @@
 from typing import List, Dict
 from config.graph_api import GraphClient
 
-def fetch_emails_with_pdfs(graph_client: GraphClient) -> List[Dict]:
+
+def fetch_emails_with_pdfs(graph_client: GraphClient, top: int = 50) -> List[Dict]:
     """
-    Fetch emails in faturas@adcecija.pt mailbox that have at least one PDF attachment.
+    Fetch PDF attachments from today's emails sent by the configured sender.
+
+    Args:
+        graph_client: An authenticated GraphClient instance.
+        top:         Maximum number of messages to retrieve.
 
     Returns:
-        A list of dicts, each with:
-            - 'email': the email object
-            - 'pdf_attachments': a list of attachment dicts that are PDFs
+        A list of dicts, each containing:
+            - 'email': the Graph email object
+            - 'pdf_attachments': a list of attachment dicts for PDFs
     """
-    emails = graph_client.get_all_emails()
-    filtered = []
+    # Retrieve messages from today by sender (uses .env SENDER_EMAIL)
+    messages = graph_client.get_emails_from_sender_today(top=top)
 
-    for email in emails:
-        attachments = email.get("attachments", [])
-        pdfs = [
-            att for att in attachments
-            if att.get("contentType") == "application/pdf"
-        ]
-
+    results: List[Dict] = []
+    for msg in messages:
+        # Graph may require expanding attachments via query; ensure attachments key present
+        attachments = msg.get('attachments', [])
+        # Filter only PDF attachments
+        pdfs = [att for att in attachments if att.get('contentType') == 'application/pdf']
         if pdfs:
-            filtered.append({
-                "email": email,
-                "pdf_attachments": pdfs
+            results.append({
+                'email': msg,
+                'pdf_attachments': pdfs
             })
-
-    return filtered
+    return results

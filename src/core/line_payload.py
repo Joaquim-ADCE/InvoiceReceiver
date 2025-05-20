@@ -45,7 +45,7 @@ def build_line_payload(
 
     # Withholding tax for vendors not starting with 'F'
     if vendor_no and not vendor_no.startswith("F"):
-        payload["Withholding_Tax_Code"] = "IRSIDENP23"
+        payload["Withholding_Tax_Code"] = "IRSINDEP23"
 
     # VAT Product Posting Group if provided
     if vat_prod_posting_group:

@@ -31,7 +31,7 @@ from utils.report_generator import send_report
 from src.core.openai_client import suggest_gl_account_from_pdf
 
 
-def orchestrate(period_days: int = 1):
+def orchestrate(period_days: int):
     """
     Full pipeline for invoice insertion:
       0. Clean up any stale __pycache__ folders
@@ -44,8 +44,11 @@ def orchestrate(period_days: int = 1):
          c. Build and post lines for each VAT category
       5. Send processing report
     """
-    # ─── 0. Cache cleanup ──────────────────────────────────────────────────────
-    clean_pycache()
+    # Get the project root directory
+    project_root = Path(__file__).parent.parent.absolute()
+    
+    # Clean pycache directories
+    clean_pycache(project_root)
 
     # ─── 1. Fetch and decode PDFs ─────────────────────────────────────────────
     print("📩 Fetching emails and PDFs...")
